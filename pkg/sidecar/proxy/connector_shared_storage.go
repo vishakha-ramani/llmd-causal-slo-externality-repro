@@ -216,6 +216,7 @@ func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostP
 	// Prepare prefill request
 	completionRequest[requestFieldMaxTokens] = 1
 	completionRequest[requestFieldMaxCompletionTokens] = 1
+	capPrefillMinTokens(completionRequest)
 	completionRequest[requestFieldCacheHitThreshold] = 0
 
 	pbody, err := json.Marshal(completionRequest)

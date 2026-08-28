@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -98,6 +99,37 @@ func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 				prefillHostPort = strings.TrimSpace(prefillHostPorts[0])
 			}
 		}
+
+		proxyRequestID := ""
+		if prefillHostPort != "" {
+			id, err := uuid.NewUUID()
+			if err != nil {
+				if err := errorBadGateway(err, w); err != nil {
+					s.logger.Error(err, "failed to send error response to client")
+				}
+				return
+			}
+			proxyRequestID = id.String()
+		}
+		placement := decisionLocal
+		if prefillHostPort != "" {
+			placement = decisionDisagg
+		}
+		decodeEndpoint := ""
+		if s.config.DecoderURL != nil {
+			decodeEndpoint = s.config.DecoderURL.Host
+		}
+		observation := newCausalRequestObservation(r, proxyRequestID, requestStart)
+		observation.setRoute(placement, decodeEndpoint, prefillHostPort)
+		ctx = context.WithValue(ctx, causalObservationContextKey, observation)
+		r = r.WithContext(ctx)
+		observedWriter := newCausalObservedResponseWriter(w, s.logger, observation)
+		w = observedWriter
+		defer func() { observation.completeAt(s.logger, time.Now()) }()
+		observation.logAt(s.logger, eventProxyRequestReceived, requestStart,
+			"api", apiType.String(),
+			"connector", s.config.KVConnector,
+			"observationClass", "proxy_boundary")
 
 		if len(prefillHostPort) == 0 {
 			s.logger.V(4).Info("skip disaggregated prefill", "api", apiType.String())
@@ -185,6 +217,7 @@ func (s *Server) disaggregatedPrefillHandler(apiType APIType) http.HandlerFunc {
 		}
 
 		s.logger.V(4).Info("no prefiller or encoder, using decoder only")
+		observation.markDecodeDispatchedAt(s.logger, time.Now())
 		if !s.forwardDataParallel || !s.dataParallelHandler(w, r) {
 			if s.config.DecodeChunkSize > 0 && r.URL.Path == ChatCompletionsPath {
 				s.runChunkedDecode(w, r)

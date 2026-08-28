@@ -95,6 +95,7 @@ func (s *Server) handleMooncake(w http.ResponseWriter, r *http.Request, prefillP
 	if _, ok := prefillData[requestFieldMaxCompletionTokens]; ok {
 		prefillData[requestFieldMaxCompletionTokens] = 1
 	}
+	capPrefillMinTokens(prefillData)
 
 	prefillBody, err := json.Marshal(prefillData)
 	if err != nil {

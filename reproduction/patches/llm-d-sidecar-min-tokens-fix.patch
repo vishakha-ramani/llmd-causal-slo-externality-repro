@@ -1,0 +1,285 @@
+diff --git a/pkg/sidecar/proxy/connector_mooncake.go b/pkg/sidecar/proxy/connector_mooncake.go
+index 4820ff4b..6d94af94 100644
+--- a/pkg/sidecar/proxy/connector_mooncake.go
++++ b/pkg/sidecar/proxy/connector_mooncake.go
+@@ -95,6 +95,7 @@ func (s *Server) handleMooncake(w http.ResponseWriter, r *http.Request, prefillP
+ 	if _, ok := prefillData[requestFieldMaxCompletionTokens]; ok {
+ 		prefillData[requestFieldMaxCompletionTokens] = 1
+ 	}
++	capPrefillMinTokens(prefillData)
+ 
+ 	prefillBody, err := json.Marshal(prefillData)
+ 	if err != nil {
+diff --git a/pkg/sidecar/proxy/connector_mooncake_test.go b/pkg/sidecar/proxy/connector_mooncake_test.go
+index 102265cd..2b5ac94a 100644
+--- a/pkg/sidecar/proxy/connector_mooncake_test.go
++++ b/pkg/sidecar/proxy/connector_mooncake_test.go
+@@ -68,7 +68,8 @@ var _ = Describe("Mooncake Connector", func() {
+ 				"messages": [
+ 				  {"role": "user", "content": "Hello"}
+ 				],
+-				"max_tokens": 50,
++				"max_tokens": 512,
++				"min_tokens": 512,
+ 				"max_completion_tokens": 100
+ 			}`
+ 		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
+@@ -106,6 +107,7 @@ var _ = Describe("Mooncake Connector", func() {
+ 
+ 		// Prefill should have max_tokens=1, max_completion_tokens=1 and stream=false
+ 		Expect(preq[requestFieldMaxTokens]).To(BeNumerically("==", 1))
++		Expect(preq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 1)))
+ 		Expect(preq).To(HaveKeyWithValue(requestFieldMaxCompletionTokens, BeNumerically("==", 1)))
+ 		Expect(preq[requestFieldStream]).To(BeFalse())
+ 
+@@ -134,7 +136,8 @@ var _ = Describe("Mooncake Connector", func() {
+ 		Expect(prefillHeaders[0].Get(mooncakeDataParallelRankHeader)).To(Equal("0"))
+ 
+ 		// Decode should preserve original max_tokens and max_completion_tokens from request
+-		Expect(dreq[requestFieldMaxTokens]).To(BeNumerically("==", 50))
++		Expect(dreq[requestFieldMaxTokens]).To(BeNumerically("==", 512))
++		Expect(dreq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 512)))
+ 		Expect(dreq).To(HaveKeyWithValue(requestFieldMaxCompletionTokens, BeNumerically("==", 100)))
+ 
+ 		testInfo.cancelFn()
+@@ -192,6 +195,8 @@ var _ = Describe("Mooncake Connector", func() {
+ 		Eventually(prefillFinished.Load).Should(BeTrue()) // use default timeout from gomega
+ 		Expect(testInfo.prefillHandler.RequestCount.Load()).To(BeNumerically("==", 1))
+ 		Expect(testInfo.decodeHandler.RequestCount.Load()).To(BeNumerically("==", 1))
++		Expect(testInfo.prefillHandler.GetCompletionRequests()[0]).ToNot(HaveKey(requestFieldMinTokens))
++		Expect(testInfo.decodeHandler.GetCompletionRequests()[0]).ToNot(HaveKey(requestFieldMinTokens))
+ 
+ 		testInfo.cancelFn()
+ 		<-testInfo.stoppedCh
+diff --git a/pkg/sidecar/proxy/connector_nixlv2.go b/pkg/sidecar/proxy/connector_nixlv2.go
+index c0178807..f2ab7a64 100644
+--- a/pkg/sidecar/proxy/connector_nixlv2.go
++++ b/pkg/sidecar/proxy/connector_nixlv2.go
+@@ -107,6 +107,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
+ 	// Save original values based on API type
+ 	streamValue, streamOk := completionRequest[requestFieldStream]
+ 	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
++	minTokensValue, minTokensOk := completionRequest[requestFieldMinTokens]
+ 
+ 	// Save and override token limit fields for prefill
+ 	type savedField struct {
+@@ -174,6 +175,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
+ 	for _, field := range tokenLimitFields {
+ 		tokenMap[field] = 1
+ 	}
++	capPrefillMinTokens(completionRequest)
+ 
+ 	pbody, err := json.Marshal(completionRequest)
+ 	if err != nil {
+@@ -320,6 +322,10 @@ retryLoop:
+ 	if streamOptionsOk {
+ 		completionRequest[requestFieldStreamOptions] = streamOptionsValue
+ 	}
++	delete(completionRequest, requestFieldMinTokens)
++	if minTokensOk {
++		completionRequest[requestFieldMinTokens] = minTokensValue
++	}
+ 
+ 	for i := range savedTokenValues[:len(tokenLimitFields)] {
+ 		sv := &savedTokenValues[i]
+@@ -456,6 +462,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
+ 	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
+ 	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
+ 	maxOutputTokensValue, maxOutputTokensOk := completionRequest[requestFieldMaxOutputTokens]
++	minTokensValue, minTokensOk := completionRequest[requestFieldMinTokens]
+ 
+ 	// Pin both legs to the same DP rank (kv_transfer_params + HTTP header).
+ 	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
+@@ -497,6 +504,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
+ 	completionRequest[requestFieldMaxTokens] = 1
+ 	completionRequest[requestFieldMaxCompletionTokens] = 1
+ 	completionRequest[requestFieldMaxOutputTokens] = 1
++	capPrefillMinTokens(completionRequest)
+ 
+ 	pbody, err := json.Marshal(completionRequest)
+ 	if err != nil {
+@@ -527,6 +535,10 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
+ 	if maxOutputTokensOk {
+ 		completionRequest[requestFieldMaxOutputTokens] = maxOutputTokensValue
+ 	}
++	delete(completionRequest, requestFieldMinTokens)
++	if minTokensOk {
++		completionRequest[requestFieldMinTokens] = minTokensValue
++	}
+ 
+ 	// Synthesise decode-leg kv_transfer_params that the serial path would
+ 	// otherwise read from the prefill response. do_remote_prefill must be true:
+diff --git a/pkg/sidecar/proxy/connector_nixlv2_test.go b/pkg/sidecar/proxy/connector_nixlv2_test.go
+index 12af8cdb..ecc4d7fd 100644
+--- a/pkg/sidecar/proxy/connector_nixlv2_test.go
++++ b/pkg/sidecar/proxy/connector_nixlv2_test.go
+@@ -982,6 +982,26 @@ var _ = Describe("NIXL Connector (v2)", func() {
+ 		Expect(dpRankHeader(env.decodeHandler, 0)).To(Equal(ph))
+ 	})
+ 
++	It("parallel-dispatch caps min_tokens only on the prefill leg", func() {
++		env := startMoRIProxy(func(c *Config) {
++			c.MoRIIOParallelDispatch = true
++		})
++		env.sendBody(`{
++			"model": "Qwen/Qwen2-0.5B",
++			"messages": [{"role": "user", "content": "Hello"}],
++			"min_tokens": 512,
++			"max_tokens": 512
++		}`)
++
++		prefillReq := env.prefillHandler.GetCompletionRequests()[0]
++		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 1)))
++		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 1)))
++
++		decodeReq := env.decodeHandler.GetCompletionRequests()[0]
++		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 512)))
++		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 512)))
++	})
++
+ 	// 2P2D DP=16 multi-pod fan-out: each leg's remote_hosts is the opposite
+ 	// side's pod IPs (prefill leg -> decode IPs, decode leg -> prefill IPs).
+ 	It("parallel-dispatch 2P2D DP=EP=16 fans out remote_hosts with opposite host lists per leg", func() {
+@@ -1142,15 +1162,19 @@ func startMoRIProxy(mutate func(cfg *Config)) *moriProxyEnv {
+ // sequential in the serial path) by the time this returns, so the captured
+ // requests / headers are safe to read afterwards.
+ func (env *moriProxyEnv) send() {
+-	req, err := http.NewRequest(http.MethodPost, env.baseAddr+ChatCompletionsPath, strings.NewReader(chatCompletionsRequestBody))
++	env.sendBody(chatCompletionsRequestBody)
++}
++
++func (env *moriProxyEnv) sendBody(body string) {
++	req, err := http.NewRequest(http.MethodPost, env.baseAddr+ChatCompletionsPath, strings.NewReader(body))
+ 	Expect(err).ToNot(HaveOccurred())
+ 	req.Header.Add(routing.PrefillEndpointHeader, env.prefillBackend.URL[len("http://"):])
+ 
+ 	rp, err := http.DefaultClient.Do(req)
+ 	Expect(err).ToNot(HaveOccurred())
+ 	defer rp.Body.Close()
+-	body, _ := io.ReadAll(rp.Body) //nolint:errcheck
+-	Expect(rp.StatusCode).To(Equal(http.StatusOK), string(body))
++	responseBody, _ := io.ReadAll(rp.Body) //nolint:errcheck
++	Expect(rp.StatusCode).To(Equal(http.StatusOK), string(responseBody))
+ }
+ 
+ // kvParams returns the kv_transfer_params map of the i-th request captured by h.
+diff --git a/pkg/sidecar/proxy/connector_shared_storage.go b/pkg/sidecar/proxy/connector_shared_storage.go
+index cd8364c4..09fc2b2c 100644
+--- a/pkg/sidecar/proxy/connector_shared_storage.go
++++ b/pkg/sidecar/proxy/connector_shared_storage.go
+@@ -216,6 +216,7 @@ func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostP
+ 	// Prepare prefill request
+ 	completionRequest[requestFieldMaxTokens] = 1
+ 	completionRequest[requestFieldMaxCompletionTokens] = 1
++	capPrefillMinTokens(completionRequest)
+ 	completionRequest[requestFieldCacheHitThreshold] = 0
+ 
+ 	pbody, err := json.Marshal(completionRequest)
+diff --git a/pkg/sidecar/proxy/connector_test.go b/pkg/sidecar/proxy/connector_test.go
+index 8762467f..dc8d1df0 100644
+--- a/pkg/sidecar/proxy/connector_test.go
++++ b/pkg/sidecar/proxy/connector_test.go
+@@ -102,7 +102,8 @@ var _ = Describe("Common Connector tests", func() {
+ 				"messages": [
+ 				  {"role": "user", "content": "Hello"}
+ 				],
+-				"max_tokens": 50,
++				"max_tokens": 512,
++				"min_tokens": 512,
+ 				"max_completion_tokens": 100
+ 			}`
+ 
+@@ -124,6 +125,7 @@ var _ = Describe("Common Connector tests", func() {
+ 				prefillReq := testInfo.prefillHandler.CompletionRequests[0]
+ 
+ 				Expect(prefillReq).To(HaveKeyWithValue("max_tokens", BeNumerically("==", 1)))
++				Expect(prefillReq).To(HaveKeyWithValue("min_tokens", BeNumerically("==", 1)))
+ 				Expect(prefillReq).To(HaveKeyWithValue("max_completion_tokens", BeNumerically("==", 1)))
+ 
+ 				By("verifying decode request has original max_completion_tokens=100")
+@@ -132,6 +134,8 @@ var _ = Describe("Common Connector tests", func() {
+ 				decodeReq := testInfo.decodeHandler.CompletionRequests[0]
+ 
+ 				// The decode request should have the original max_completion_tokens value
++				Expect(decodeReq).To(HaveKeyWithValue("max_tokens", BeNumerically("==", 512)))
++				Expect(decodeReq).To(HaveKeyWithValue("min_tokens", BeNumerically("==", 512)))
+ 				Expect(decodeReq).To(HaveKeyWithValue("max_completion_tokens", BeNumerically("==", 100)))
+ 
+ 				testInfo.cancelFn()
+@@ -185,6 +189,7 @@ var _ = Describe("Common Connector tests", func() {
+ 
+ 				Expect(prefillReq).To(HaveKeyWithValue("max_tokens", BeNumerically("==", 1)))
+ 				Expect(prefillReq).To(HaveKeyWithValue("max_completion_tokens", BeNumerically("==", 1)))
++				Expect(prefillReq).ToNot(HaveKey("min_tokens"))
+ 
+ 				By("verifying decode request does not have max_completion_tokens since it wasn't in original request")
+ 				Expect(testInfo.decodeHandler.RequestCount.Load()).To(BeNumerically("==", 1))
+@@ -193,6 +198,7 @@ var _ = Describe("Common Connector tests", func() {
+ 
+ 				// The decode request should not have max_completion_tokens if it wasn't in the original request
+ 				Expect(decodeReq).ToNot(HaveKey("max_completion_tokens"))
++				Expect(decodeReq).ToNot(HaveKey("min_tokens"))
+ 
+ 				testInfo.cancelFn()
+ 				<-testInfo.stoppedCh
+diff --git a/pkg/sidecar/proxy/proxy.go b/pkg/sidecar/proxy/proxy.go
+index bdfc6145..ad55cdd6 100644
+--- a/pkg/sidecar/proxy/proxy.go
++++ b/pkg/sidecar/proxy/proxy.go
+@@ -144,6 +144,16 @@ func tokenLimitFieldsForAPIType(api APIType) []string {
+ 	}
+ }
+ 
++// capPrefillMinTokens keeps a one-token prefill request valid when the client
++// supplied a larger minimum generation length. The decode request must retain
++// the client's original value; callers that mutate the original map are
++// responsible for restoring it before dispatching decode.
++func capPrefillMinTokens(request map[string]any) {
++	if _, present := request[requestFieldMinTokens]; present {
++		request[requestFieldMinTokens] = 1
++	}
++}
++
+ // Config represents the complete runtime configuration for the proxy server.
+ type Config struct {
+ 	// Port is the port the sidecar is listening on.
+diff --git a/pkg/sidecar/proxy/options.go b/pkg/sidecar/proxy/options.go
+index d13c3b07..b229f033 100644
+--- a/pkg/sidecar/proxy/options.go
++++ b/pkg/sidecar/proxy/options.go
+@@ -53,6 +53,7 @@ const (
+ 
+ 	// Flags
+ 	port                      = "port"
++	modelServerPort           = "model-server-port"
+ 	vllmPort                  = "vllm-port"
+ 	dataParallelSize          = "data-parallel-size"
+ 	kvConnector               = "kv-connector"
+@@ -247,6 +248,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
+ 	// Add Go flags to pflag (for zap options compatibility)
+ 	fs.AddGoFlagSet(goFlagSet)
+ 	fs.StringVar(&opts.Port, port, opts.Port, "the port the sidecar is listening on")
++	fs.StringVar(&opts.vllmPort, modelServerPort, opts.vllmPort, "the port the model server is listening on")
+ 	fs.StringVar(&opts.vllmPort, vllmPort, opts.vllmPort, "the port vLLM is listening on")
+ 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the vLLM DATA-PARALLEL-SIZE value")
+ 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
+diff --git a/pkg/sidecar/proxy/options_test.go b/pkg/sidecar/proxy/options_test.go
+index 80c8195b..16bc259a 100644
+--- a/pkg/sidecar/proxy/options_test.go
++++ b/pkg/sidecar/proxy/options_test.go
+@@ -595,6 +595,15 @@ func TestNewOptionsWithEnvVars(t *testing.T) {
+ 	}
+ }
+ 
++func TestModelServerPortAlias(t *testing.T) {
++	opts, testPFlagSet := newTestOptions(t)
++
++	require.NoError(t, testPFlagSet.Parse([]string{"--model-server-port=8200"}))
++	require.NoError(t, opts.Complete())
++	require.NoError(t, opts.Validate())
++	require.Equal(t, "http://localhost:8200", opts.DecoderURL.String())
++}
++
+ func TestValidateConnector(t *testing.T) {
+ 	tests := []struct {
+ 		name      string

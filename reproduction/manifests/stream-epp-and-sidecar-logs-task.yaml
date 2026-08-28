@@ -1,0 +1,100 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: stream-epp-logs
+  namespace: vramani-perfcal
+  labels:
+    app.kubernetes.io/managed-by: vramani-causal-observe
+spec:
+  description: >-
+    Streams request-keyed causal JSON logs from the EPP and every decoder
+    routing-proxy into the run result directory until collection completes.
+  params:
+  - name: namespace
+    type: string
+  - name: resultsDir
+    type: string
+  - name: windowMinutes
+    type: string
+    default: "2"
+  workspaces:
+  - name: data
+    description: Shared results PVC
+  steps:
+  - name: stream-causal-logs
+    image: alpine/kubectl:1.34.1
+    securityContext:
+      runAsUser: 0
+    script: |
+      #!/bin/sh
+      set +e
+
+      namespace="$(params.namespace)"
+      results_dir="$(workspaces.data.path)/$(params.resultsDir)"
+      sentinel="${results_dir}/epp_stream_done"
+      epp_dir="${results_dir}/epp_logs"
+      sidecar_dir="${results_dir}/sidecar_logs"
+      mkdir -p "${epp_dir}" "${sidecar_dir}"
+      rm -f "${sentinel}"
+
+      epp_pods=""
+      decoder_pods=""
+      attempt=0
+      while [ "${attempt}" -lt 20 ]; do
+        epp_pods=$(kubectl get pods -n "${namespace}" \
+          -l llm-d.ai/igw-mode=llm-d-router-gateway \
+          --field-selector=status.phase=Running \
+          -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null || true)
+        decoder_pods=$(kubectl get pods -n "${namespace}" \
+          -l llm-d.ai/role=decode \
+          --field-selector=status.phase=Running \
+          -o custom-columns=NAME:.metadata.name --no-headers 2>/dev/null || true)
+        [ -n "${epp_pods}" ] && [ -n "${decoder_pods}" ] && break
+        attempt=$((attempt + 1))
+        sleep 3
+      done
+
+      if [ -z "${epp_pods}" ] || [ -z "${decoder_pods}" ]; then
+        echo "WARNING: causal log pod discovery failed: epp='${epp_pods}' decoders='${decoder_pods}'"
+        exit 0
+      fi
+
+      pids=""
+      fifos=""
+      start_stream() {
+        pod="$1"
+        container="$2"
+        output="$3"
+        fifo="/tmp/${container}-${pod}.fifo"
+        rm -f "${fifo}"
+        mkfifo "${fifo}"
+        fifos="${fifos} ${fifo}"
+        awk '{ sub(/^[^ ]+ /, ""); print; fflush() }' < "${fifo}" > "${output}" &
+        pids="${pids} $!"
+        kubectl logs --follow --timestamps=true "${pod}" -n "${namespace}" -c "${container}" > "${fifo}" 2> "${output}.stderr" &
+        pids="${pids} $!"
+      }
+
+      for pod in ${epp_pods}; do
+        start_stream "${pod}" epp "${epp_dir}/${pod}.log"
+      done
+      for pod in ${decoder_pods}; do
+        start_stream "${pod}" routing-proxy "${sidecar_dir}/${pod}.log"
+      done
+
+      while [ ! -f "${sentinel}" ]; do
+        any_alive=false
+        for pid in ${pids}; do
+          if kill -0 "${pid}" 2>/dev/null; then
+            any_alive=true
+            break
+          fi
+        done
+        ${any_alive} || break
+        sleep 2
+      done
+
+      kill ${pids} 2>/dev/null || true
+      wait 2>/dev/null || true
+      rm -f ${fifos}
+      touch "${results_dir}/causal_log_stream_done"

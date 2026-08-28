@@ -60,15 +60,24 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		return
 	}
 
-	// Generate unique request UUID
-	uuid, err := uuid.NewUUID()
-	if err != nil {
-		if err := errorBadGateway(err, w); err != nil {
-			s.logger.Error(err, "failed to send error response to client")
-		}
-		return
+	observation := causalObservationFromRequest(r)
+	uuidStr := ""
+	if observation != nil {
+		uuidStr = observation.proxyID()
 	}
-	uuidStr := uuid.String()
+	if uuidStr == "" {
+		generatedID, err := uuid.NewUUID()
+		if err != nil {
+			if err := errorBadGateway(err, w); err != nil {
+				s.logger.Error(err, "failed to send error response to client")
+			}
+			return
+		}
+		uuidStr = generatedID.String()
+		if observation != nil {
+			observation.setProxyID(uuidStr)
+		}
+	}
 
 	// Parallel-dispatch path synthesises decode's kv_transfer_params from config
 	// instead of the prefill response. The serial path below is unchanged when off.
@@ -96,7 +105,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// 1. Prepare prefill request
 	preq := r.Clone(ctx)
 
-	preq.Header.Add(requestHeaderRequestID, uuidStr)
+	preq.Header.Set(requestHeaderRequestID, uuidStr)
 
 	// Pin both legs to the same DP rank; the header is skipped for single-DP.
 	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
@@ -107,6 +116,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// Save original values based on API type
 	streamValue, streamOk := completionRequest[requestFieldStream]
 	streamOptionsValue, streamOptionsOk := completionRequest[requestFieldStreamOptions]
+	minTokensValue, minTokensOk := completionRequest[requestFieldMinTokens]
 
 	// Save and override token limit fields for prefill
 	type savedField struct {
@@ -174,6 +184,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	for _, field := range tokenLimitFields {
 		tokenMap[field] = 1
 	}
+	capPrefillMinTokens(completionRequest)
 
 	pbody, err := json.Marshal(completionRequest)
 	if err != nil {
@@ -202,8 +213,17 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	// under load. Retrying the same host avoids expensive local prefill on
 	// decode. Non-transient errors (500/501) fail immediately.
 	var pw *bufferedResponseWriter
+	prefillDispatchAt := time.Now()
+	prefillAttempts := 0
 retryLoop:
 	for attempt := 0; ; attempt++ {
+		prefillAttempts++
+		if observation != nil {
+			observation.logAt(s.logger, eventPrefillDispatched, time.Now(),
+				"attempt", attempt+1,
+				"stageElapsedUs", time.Since(prefillDispatchAt).Microseconds(),
+				"observationClass", "proxy_boundary")
+		}
 		pw = &bufferedResponseWriter{}
 		preq.Body = io.NopCloser(bytes.NewReader(pbody))
 		preq.ContentLength = int64(len(pbody))
@@ -233,6 +253,13 @@ retryLoop:
 	}
 
 	prefillDuration := time.Since(prefillStart)
+	if observation != nil {
+		observation.logAt(s.logger, eventPrefillCompleted, time.Now(),
+			"stageElapsedUs", time.Since(prefillDispatchAt).Microseconds(),
+			"statusCode", pw.statusCode,
+			"attempts", prefillAttempts,
+			"observationClass", "http_round_trip")
+	}
 	prefillSpan.SetAttributes(
 		attribute.Int("llm_d.pd_proxy.prefill.status_code", pw.statusCode),
 		attribute.Float64("llm_d.pd_proxy.prefill.duration_ms", float64(prefillDuration.Milliseconds())),
@@ -298,7 +325,7 @@ retryLoop:
 	// 1. Prepare decode request
 	dreq := r.Clone(ctx)
 
-	dreq.Header.Add(requestHeaderRequestID, uuidStr)
+	dreq.Header.Set(requestHeaderRequestID, uuidStr)
 
 	// Stamp the same DP-rank pin on the decode leg.
 	if s.config.MoRIIODPSize > 1 {
@@ -319,6 +346,10 @@ retryLoop:
 	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.streaming", streamingEnabled))
 	if streamOptionsOk {
 		completionRequest[requestFieldStreamOptions] = streamOptionsValue
+	}
+	delete(completionRequest, requestFieldMinTokens)
+	if minTokensOk {
+		completionRequest[requestFieldMinTokens] = minTokensValue
 	}
 
 	for i := range savedTokenValues[:len(tokenLimitFields)] {
@@ -390,6 +421,9 @@ retryLoop:
 	// 2. Forward to local decoder.
 
 	s.logger.V(5).Info("sending request to decoder", "body", string(dbody))
+	if observation != nil {
+		observation.markDecodeDispatchedAt(s.logger, time.Now())
+	}
 	decodeWriter, finalizeDecodeWriter := newCachedTokensResponseWriterWithFinalize(w, pCachedTokens)
 	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(decodeWriter, dreq)
 	decodeSpan.SetAttributes(attribute.Bool("llm_d.pd_proxy.decode.data_parallel", dataParallelUsed))
@@ -448,6 +482,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	tracer := tracing.Tracer()
 	parentCtx := r.Context()
 	requestStartedAt := time.Now()
+	observation := causalObservationFromRequest(r)
 
 	// Snapshot client fields before mutating completionRequest into the prefill
 	// body; they are restored when building the decode body.
@@ -456,6 +491,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	maxTokensValue, maxTokensOk := completionRequest[requestFieldMaxTokens]
 	maxCompletionTokensValue, maxCompletionTokensOk := completionRequest[requestFieldMaxCompletionTokens]
 	maxOutputTokensValue, maxOutputTokensOk := completionRequest[requestFieldMaxOutputTokens]
+	minTokensValue, minTokensOk := completionRequest[requestFieldMinTokens]
 
 	// Pin both legs to the same DP rank (kv_transfer_params + HTTP header).
 	dpRank := pickDPRank(uuidStr, s.config.MoRIIODPSize)
@@ -497,6 +533,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	completionRequest[requestFieldMaxTokens] = 1
 	completionRequest[requestFieldMaxCompletionTokens] = 1
 	completionRequest[requestFieldMaxOutputTokens] = 1
+	capPrefillMinTokens(completionRequest)
 
 	pbody, err := json.Marshal(completionRequest)
 	if err != nil {
@@ -526,6 +563,10 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	delete(completionRequest, requestFieldMaxOutputTokens)
 	if maxOutputTokensOk {
 		completionRequest[requestFieldMaxOutputTokens] = maxOutputTokensValue
+	}
+	delete(completionRequest, requestFieldMinTokens)
+	if minTokensOk {
+		completionRequest[requestFieldMinTokens] = minTokensValue
 	}
 
 	// Synthesise decode-leg kv_transfer_params that the serial path would
@@ -631,6 +672,13 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	var prefillStatus int
 	var prefillBody string
 	prefillStartedAt := time.Now()
+	if observation != nil {
+		observation.logAt(s.logger, eventPrefillDispatched, prefillStartedAt,
+			"attempt", 1,
+			"stageElapsedUs", int64(0),
+			"parallelDispatch", true,
+			"observationClass", "proxy_boundary")
+	}
 	go func() {
 		defer wg.Done()
 		defer prefillSpan.End()
@@ -638,6 +686,14 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		prefillHandler.ServeHTTP(pw, preq)
 		prefillStatus = pw.statusCode
 		prefillBody = pw.buffer.String()
+		if observation != nil {
+			observation.logAt(s.logger, eventPrefillCompleted, time.Now(),
+				"stageElapsedUs", time.Since(prefillStartedAt).Microseconds(),
+				"statusCode", pw.statusCode,
+				"attempts", 1,
+				"parallelDispatch", true,
+				"observationClass", "http_round_trip")
+		}
 		prefillSpan.SetAttributes(
 			attribute.Int("llm_d.pd_proxy.prefill.status_code", pw.statusCode),
 			attribute.Float64("llm_d.pd_proxy.prefill.duration_ms", float64(time.Since(prefillStartedAt).Milliseconds())),
@@ -653,6 +709,9 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// dataParallelHandler may steal the request and dispatch to another
 	// data-parallel replica; preserve that semantics.
 	decodeStartedAt := time.Now()
+	if observation != nil {
+		observation.markDecodeDispatchedAt(s.logger, decodeStartedAt)
+	}
 	go func() {
 		defer wg.Done()
 		dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(w, dreq)

@@ -595,6 +595,15 @@ func TestNewOptionsWithEnvVars(t *testing.T) {
 	}
 }
 
+func TestModelServerPortAlias(t *testing.T) {
+	opts, testPFlagSet := newTestOptions(t)
+
+	require.NoError(t, testPFlagSet.Parse([]string{"--model-server-port=8200"}))
+	require.NoError(t, opts.Complete())
+	require.NoError(t, opts.Validate())
+	require.Equal(t, "http://localhost:8200", opts.DecoderURL.String())
+}
+
 func TestValidateConnector(t *testing.T) {
 	tests := []struct {
 		name      string

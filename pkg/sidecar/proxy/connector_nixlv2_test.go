@@ -172,6 +172,56 @@ var _ = Describe("NIXL Connector (v2)", func() {
 
 	})
 
+	It("should retain one incoming ID while assigning one shared proxy ID to both vLLM legs", func() {
+		proxyBaseAddr := startProxy()
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath,
+			bytes.NewReader([]byte(chatCompletionsRequestBody)))
+		Expect(err).ToNot(HaveOccurred())
+		req.Header.Set(requestHeaderRequestID, "epp-request-17")
+		req.Header.Set(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+
+		response, err := http.DefaultClient.Do(req)
+		Expect(err).ToNot(HaveOccurred())
+		defer response.Body.Close()
+		_, err = io.ReadAll(response.Body)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response.StatusCode).To(Equal(http.StatusOK))
+
+		prefillIDs := testInfo.prefillHandler.GetCompletionHeaders()[0].Values(requestHeaderRequestID)
+		decodeIDs := testInfo.decodeHandler.GetCompletionHeaders()[0].Values(requestHeaderRequestID)
+		Expect(prefillIDs).To(HaveLen(1))
+		Expect(decodeIDs).To(HaveLen(1))
+		Expect(prefillIDs[0]).ToNot(Equal("epp-request-17"))
+		Expect(decodeIDs[0]).To(Equal(prefillIDs[0]))
+	})
+
+	It("should cap min_tokens only on the serial prefill leg", func() {
+		proxyBaseAddr := startProxy()
+		body := `{
+			"model": "Qwen/Qwen3-14B",
+			"messages": [{"role": "user", "content": "Hello"}],
+			"min_tokens": 512,
+			"max_tokens": 512
+		}`
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
+		Expect(err).ToNot(HaveOccurred())
+		req.Header.Set(routing.PrefillEndpointHeader, testInfo.prefillBackend.URL[len("http://"):])
+
+		response, err := http.DefaultClient.Do(req)
+		Expect(err).ToNot(HaveOccurred())
+		defer response.Body.Close()
+		_, err = io.ReadAll(response.Body)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(response.StatusCode).To(Equal(http.StatusOK))
+
+		prefillReq := testInfo.prefillHandler.GetCompletionRequests()[0]
+		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 1)))
+		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 1)))
+		decodeReq := testInfo.decodeHandler.GetCompletionRequests()[0]
+		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 512)))
+		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 512)))
+	})
+
 	It("should add prefiller cached tokens when decoder usage details omit cached_tokens", func() {
 		testInfo.decodeHandler.RawResponse = `{"id":"chatcmpl-test","object":"chat.completion","choices":[],"usage":{"prompt_tokens":64,"completion_tokens":1,"total_tokens":65,"prompt_tokens_details":{}}}`
 		proxyBaseAddr := startProxy()
@@ -982,6 +1032,26 @@ var _ = Describe("NIXL Connector (v2)", func() {
 		Expect(dpRankHeader(env.decodeHandler, 0)).To(Equal(ph))
 	})
 
+	It("parallel-dispatch caps min_tokens only on the prefill leg", func() {
+		env := startMoRIProxy(func(c *Config) {
+			c.MoRIIOParallelDispatch = true
+		})
+		env.sendBody(`{
+			"model": "Qwen/Qwen3-14B",
+			"messages": [{"role": "user", "content": "Hello"}],
+			"min_tokens": 512,
+			"max_tokens": 512
+		}`)
+
+		prefillReq := env.prefillHandler.GetCompletionRequests()[0]
+		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 1)))
+		Expect(prefillReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 1)))
+
+		decodeReq := env.decodeHandler.GetCompletionRequests()[0]
+		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 512)))
+		Expect(decodeReq).To(HaveKeyWithValue(requestFieldMaxTokens, BeNumerically("==", 512)))
+	})
+
 	// 2P2D DP=16 multi-pod fan-out: each leg's remote_hosts is the opposite
 	// side's pod IPs (prefill leg -> decode IPs, decode leg -> prefill IPs).
 	It("parallel-dispatch 2P2D DP=EP=16 fans out remote_hosts with opposite host lists per leg", func() {
@@ -1142,15 +1212,19 @@ func startMoRIProxy(mutate func(cfg *Config)) *moriProxyEnv {
 // sequential in the serial path) by the time this returns, so the captured
 // requests / headers are safe to read afterwards.
 func (env *moriProxyEnv) send() {
-	req, err := http.NewRequest(http.MethodPost, env.baseAddr+ChatCompletionsPath, strings.NewReader(chatCompletionsRequestBody))
+	env.sendBody(chatCompletionsRequestBody)
+}
+
+func (env *moriProxyEnv) sendBody(body string) {
+	req, err := http.NewRequest(http.MethodPost, env.baseAddr+ChatCompletionsPath, strings.NewReader(body))
 	Expect(err).ToNot(HaveOccurred())
 	req.Header.Add(routing.PrefillEndpointHeader, env.prefillBackend.URL[len("http://"):])
 
 	rp, err := http.DefaultClient.Do(req)
 	Expect(err).ToNot(HaveOccurred())
 	defer rp.Body.Close()
-	body, _ := io.ReadAll(rp.Body) //nolint:errcheck
-	Expect(rp.StatusCode).To(Equal(http.StatusOK), string(body))
+	responseBody, _ := io.ReadAll(rp.Body) //nolint:errcheck
+	Expect(rp.StatusCode).To(Equal(http.StatusOK), string(responseBody))
 }
 
 // kvParams returns the kv_transfer_params map of the i-th request captured by h.

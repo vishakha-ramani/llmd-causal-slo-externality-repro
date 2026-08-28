@@ -1,91 +1,187 @@
-[![Go Report Card](https://goreportcard.com/badge/github.com/llm-d/llm-d-router)](https://goreportcard.com/report/github.com/llm-d/llm-d-router)
-[![Go Reference](https://pkg.go.dev/badge/github.com/llm-d/llm-d-router.svg)](https://pkg.go.dev/github.com/llm-d/llm-d-router)
-[![License](https://img.shields.io/github/license/llm-d/llm-d-router)](/LICENSE)
-[![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://llm-d.slack.com/archives/C08SBNRRSBD)
+# llm-d causal SLO-externality reproduction
 
-# llm-d Router
+This repository is a pinned research snapshot of the llm-d Router port of the
+INFOCOM causal SLO-externality policy, its proxy-side observability, and the
+first Qwen3-14B real-stack prediction-versus-observation experiment.
 
-> [!IMPORTANT]
-> **Terminology Change**: The *Inference Scheduler* has been renamed to **llm-d Router**; see [Terminology](README.md#terminology).
+It is based on upstream `llm-d/llm-d-router` tag `v0.9.0`, commit
+`5f4e762f341a5196393ce79f8a57c3e1900c4a6b`. It is not an upstream llm-d
+branch. The exact code, images, dependencies, model caveat, and platform are in
+[reproduction/VERSIONS.md](reproduction/VERSIONS.md).
 
-> [!IMPORTANT]
-> **API & Code Consolidation**: Core Endpoint Picker (EPP) code and the `InferenceObjective` and `InferenceModelRewrite` APIs have been merged into this repository from [Gateway API Inference Extension (GIE)]. The GIE repository now exclusively hosts the `InferencePool` API—an extension of the [Kubernetes Gateway API]—and defines the Endpoint Picker Protocol.
+## 60-second status
 
-The **llm-d Router** is the intelligent entry point for inference traffic, delivering LLM load and prefix-cache aware routing, request prioritization, and advanced flow control across diverse request formats to fulfill complex serving objectives. It supports a flexible deployment model: it can run in **Standalone Mode** (where a self-managed Envoy proxy runs alongside the EPP in the same pod) or integrate with L7 load balancers—including self-managed instances (e.g., Istio, AgentGateway) and cloud-managed services (e.g., Google Cloud's Application Load Balancer)—via the Kubernetes Gateway API. 
+- Michael's proxy-style port provides the causal joint P/D candidate scorer,
+  shadow state, and llm-d integration without modifying vLLM.
+- This snapshot adds request-keyed EPP/sidecar events and an offline analyzer
+  so each prediction can be joined to client-, proxy-, and NIXL-observed time.
+- R5 ran Qwen3-14B BF16, TP=1, with one prefiller and two decoders on three
+  H100 80 GB GPUs. All 20 requests completed; the policy chose 17 local and 3
+  disaggregated placements.
+- Strict replay joins 20/20 requests. All 76 candidate rows satisfy the logged
+  arithmetic identities; maximum error is `3.64e-12 us`.
+- Local client TTFT MAPE is 6.87%, remote prefill MAPE is 3.68%, and early
+  decode-iteration MAPE is 5.72% local / 8.62% remote.
+- The important negative result is the remote path: the one unambiguous
+  transfer was 599.502 ms observed versus 200.627 ms predicted, and the remote
+  post-prefill tail has 1.058 s MAE.
+- This demonstrates real-stack execution and validates several component
+  predictions. It does **not** yet prove counterfactual SLO externality or an
+  end-to-end policy advantage over a baseline.
 
-The router achieves its intelligence through an **Endpoint Picker (EPP)** that integrates with production-grade proxies (such as [Envoy]) via the [ext-proc] protocol, injecting real-time signals into the data plane to optimize request placement.
+## Reproduce R5 locally
 
-<p align="center">
-  <img src="docs/images/llm-d-router.svg" width="800" alt="llm-d Router Architecture">
-</p>
+Only Python 3, `make`, and standard Unix utilities are needed. No GPU, cluster,
+Python packages, or access to the original environment is required.
 
-## Core Components and APIs
+```bash
+git clone https://github.com/vishakha-ramani/llmd-causal-slo-externality-repro.git
+cd llmd-causal-slo-externality-repro
+make -C reproduction verify
+```
 
-This repository hosts the following core components:
+Expected final lines:
 
-- **Endpoint Picker (EPP)**: The intelligent routing engine that serves as the "brain" of the router. It evaluates incoming requests against the current state of the [InferencePool], considering factors like KV-cache locality, current load, and priority to make optimal placement decisions. It integrates with L7 proxies via the `ext-proc` protocol.
-- **Request Management APIs**: These resources directly influence the EPP's request handling behavior:
-    - **InferenceObjective**: Configures the EPP's scheduling goals for specific requests, including priority levels and performance targets.
-    - **InferenceModelRewrite**: Directs the EPP to perform model name rewriting, enabling flexible traffic management for A/B testing and canary rollouts.
-- **Disaggregation Sidecar**: A coordination component deployed alongside model servers (typically as a sidecar to the decode worker). It orchestrates complex multi-stage inference lifecycles, such as **P/D (Prefill/Decode)** and **E/P/D (Encode/Prefill/Decode)**, by communicating with specialized encode and prefill workers to manage KV-cache and embedding transfers. For more details, see the [Disaggregation Documentation].
+```text
+Ran 5 tests in ...
+OK
+R5 strict joins and byte-for-byte result replay: PASS
+```
 
-## Modes of Operation
+The command:
 
-The llm-d Router supports two primary deployment modes as specified in the [Kubernetes Gateway API Inference Extensions]:
+1. tests the analyzer, including compressed-log ingestion;
+2. replays all 10,736 packaged causal events in strict mode;
+3. requires complete client/EPP/sidecar joins and exact logged identities; and
+4. compares the regenerated JSON and both CSVs byte-for-byte with the committed
+   R5 results.
 
-### 1. Standalone Mode
-A lightweight deployment where a self-managed Envoy proxy runs alongside the EPP in the same pod. This mode is ideal for clusters without Gateway API infrastructure or for basic testing and local evaluations.
+Generated files are written under `reproduction/out/r5/`. To run the analyzer
+directly:
 
-### 2. Gateway Mode (Inference Gateway)
-The recommended mode for production environments, leveraging the official [Gateway API]. In this mode, the EPP acts as a backend for an `InferencePool`, which is referenced by an `HTTPRoute` on a shared `Gateway`. This enables advanced traffic management, multi-cluster load balancing, and shared infrastructure for both inference and traditional workloads.
+```bash
+python3 reproduction/scripts/analyze-causal-observability.py \
+  reproduction/data/r5/events.jsonl.gz \
+  --client-trace reproduction/data/r5/trace_data.csv \
+  --transfer-windows reproduction/data/r5/nixl-transfer-windows.csv \
+  --report-out /tmp/prediction-validation.json \
+  --rows-out /tmp/prediction-residuals.csv \
+  --externality-rows-out /tmp/resident-prediction-residuals.csv \
+  --strict
+```
 
-For more details on the router architecture, routing logic, and different plugins (filters and scorers), see the [Architecture Documentation].
+## Verify and build the source
 
----
+The focused tests cover the causal policy, timing identities, event schema,
+sidecar request-ID propagation, and the `min_tokens`/`max_tokens` P/D fix:
 
-> [!NOTE]
-> The project provides tools for automatic Envoy installation. However, if you install or
-> configure it yourself, please note that the only supported [request_body_mode and response_body_mode](https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto)
-> is `FULL_DUPLEX_STREAMED`
+```bash
+go test -race \
+  ./pkg/epp/framework/plugins/scheduling/profilehandler/causalsloexternality \
+  ./pkg/sidecar/proxy
+```
 
-## Terminology
+The upstream build also supports containerized tests and image builds:
 
-To ensure clarity across the project, we use the following standard terminology:
+```bash
+make test-unit
+IMAGE_REGISTRY=quay.io/YOUR_QUAY_NAMESPACE \
+  EPP_TAG=causal-qwen-repro \
+  SIDECAR_TAG=causal-qwen-repro \
+  make image-build
+```
 
-- **llm-d Router**: The complete intelligent entry point, comprising both the **Proxy** (e.g., Envoy) and the **Endpoint Picker (EPP)**. This term replaces "Inference Scheduler" in all contexts.
-- **llm-d Endpoint Picker (EPP)**: The specific component that implements the routing intelligence and scoring logic. Use this term when referring to capabilities or configurations specific to the EPP itself, rather than the request routing system as a whole.
-- **Inference Gateway**: A synonym for the **llm-d Router** when operating in **Gateway Mode**.
-- **Request Scheduler**: A sub-component within the EPP responsible for the queuing and dispatching of requests.
+The published R5 images are already public, so rebuilding is optional. Do not
+push to `llm-d/llm-d-router`; use a registry and repository you own.
 
-[Kubernetes]:https://kubernetes.io
-[Kubernetes Gateway API]:https://gateway-api.sigs.k8s.io/
-[Architecture Documentation]:docs/architecture.md
-[Disaggregation Documentation]:docs/disaggregation.md
-[InferencePool]:https://github.com/kubernetes-sigs/gateway-api-inference-extension
-[Gateway API Inference Extension (GIE)]:https://github.com/kubernetes-sigs/gateway-api-inference-extension
-[Kubernetes Gateway API Inference Extensions]:https://github.com/kubernetes-sigs/gateway-api-inference-extension
-[Gateway API]:https://github.com/kubernetes-sigs/gateway-api
-[Envoy]:https://github.com/envoyproxy/envoy
-[ext-proc]:https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter
+## Generate the real-cluster experiment
 
-## Contributing
+Ruby is needed only to generate a new PipelineRun:
 
-Start with the [llm-d organization contributing guide][org-contributing] for project-wide guidelines, code of conduct, and community resources.
+```bash
+make -C reproduction verify-manifest
+```
 
-Our community meeting is bi-weekly at Wednesday 10AM PDT ([Google Meet], [Meeting Notes]).
+For a cluster-specific manifest, supply your own namespace, service account,
+PVCs, secret, and optional image/repository overrides:
 
-We currently utilize the [#sig-router] channel in llm-d Slack workspace for communications.
+```bash
+cd reproduction
+export NAMESPACE=my-namespace
+export SERVICE_ACCOUNT=my-tekton-service-account
+export DATA_PVC=my-results-pvc
+export SOURCE_PVC=my-source-pvc
+export HF_SECRET=my-huggingface-secret
+export PIPELINE_NAME=sim2real
+export RUN_NAME="qwen-causal-$(date +%Y%m%d-%H%M%S)"
 
-For large changes please [create an issue] first describing the change so the
-maintainers can do an assessment, and work on the details with you. See
-[DEVELOPMENT.md](DEVELOPMENT.md) for details on how to work with the codebase.
+PIPELINERUN_TEMPLATE="$PWD/scripts/causal-qwen-overlap-20260827-151229.yaml" \
+RATE=1 REQUESTS=20 INPUT_TOKENS=15000 OUTPUT_TOKENS=512 \
+ruby scripts/generate-qwen-iterlaw-run.rb \
+  causal "$RUN_NAME" "out/$RUN_NAME.yaml"
+```
 
-Contributions are welcome!
+The complete preflight, submission, collection, and analysis commands are in
+[reproduction/CLUSTER.md](reproduction/CLUSTER.md). A full R5-equivalent run
+requires the llm-d-benchmark `sim2real` Tekton pipeline, two shared PVCs,
+RDMA/NIXL/Multus support, and three H100 80 GB GPUs. Those are infrastructure
+requirements, not bundled software dependencies.
 
-[org-contributing]:https://github.com/llm-d/llm-d/blob/main/CONTRIBUTING.md
-[create an issue]:https://github.com/llm-d/llm-d-router/issues/new
-[discussion]:https://github.com/llm-d/llm-d-router/discussions/new?category=q-a
-[Slack]:https://llm-d.slack.com/
-[Google Meet]:https://meet.google.com/zij-zekm-jvt
-[Meeting Notes]:https://docs.google.com/document/d/1Pf3x7ZM8nNpU56nt6CzePAOmFZ24NXDeXyaYb565Wq4
-[#sig-router]:https://llm-d.slack.com/?redir=%2Fmessages%2Fsig-router
+## Iteration-time law being tested
+
+For one GPU iteration, the implementation adds the marginal work of every
+scheduled decode request and every scheduled prefill grant:
+
+```text
+T_iter = alpha
+       + C0 * B_decode
+       + C1 * sum(decode context tokens)
+       + C_pf * sum(prefill grant tokens)
+       + C_attn * sum(grant * (prefix + grant/2))
+```
+
+The intercept is charged once for the complete batch. A dedicated prefiller
+sets the two decode terms to zero; a mixed decoder iteration retains all five
+terms. The implementation is in
+[`coeffs.go`](pkg/epp/framework/plugins/scheduling/profilehandler/causalsloexternality/coeffs.go),
+and the direct marginal-sum test is in
+[`score_test.go`](pkg/epp/framework/plugins/scheduling/profilehandler/causalsloexternality/score_test.go).
+
+R5 deliberately accepted only clean snapshots and therefore did not itself
+exercise live mixed resident-prefill terms. Independent calibration used
+decode-only and prefill-only data for fitting and held 72 mixed rows out for
+validation (6.96% MAPE). See [docs/VALIDATION-R5.md](docs/VALIDATION-R5.md) and
+[reproduction/TODO.md](reproduction/TODO.md) for the evidence and remaining
+coefficient study.
+
+## Repository map
+
+- `pkg/epp/.../causalsloexternality/`: joint P/D policy and decomposed logging.
+- `pkg/sidecar/proxy/`: proxy boundary, token-event, and transfer correlation.
+- `reproduction/`: one-command replay, portable generator, exact manifests,
+  minimum event data, committed outputs, versions, and follow-up plan.
+- `docs/PORTING.md`: how the BLIS policy maps into llm-d.
+- `docs/VALIDATION-R5.md`: measurement contract and result interpretation.
+- `docs/ITERATION-LAW-AUDIT.md`: Qwen coefficient and marginal-law audit.
+- `docs/SESSION-CHECKPOINT.md`: detailed experiment history and operational
+  notes.
+- `reproduction/patches/`: standalone sidecar fix for comparison with the
+  pinned upstream tree; the fix is already applied in this repository.
+- `docs/UPSTREAM-README.md`: README from the pinned upstream router snapshot.
+
+Here, **stock** means the comparison arm using the upstream/default llm-d
+routing policy and configuration. It does not mean unmodified vLLM, and it
+does not refer to Michael's port or the causal policy.
+
+## Claim boundary and next experiment
+
+The current evidence supports the plumbing, logged formula identities, local
+first-token prediction, remote prefill prediction, and early iteration model.
+It also identifies two real gaps: loaded transfer/post-prefill timing and the
+unobserved counterfactual for resident requests.
+
+The next claim-bearing experiment is a matched causal-versus-stock study with
+an explicit output-estimator warmup, repeated seeds, controlled overlap, and a
+fixed-snapshot replay or paired intervention for resident externality. Report
+TTFT/ITL/E2E goodput, placement decisions, confidence intervals, and the
+prediction residuals alongside policy outcomes.

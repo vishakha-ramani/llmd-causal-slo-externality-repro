@@ -1,0 +1,590 @@
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: causal-qwen-overlap-20260827-151229
+  namespace: kalantar-0
+spec:
+  params:
+  - name: experimentId
+    value: causal-qwen-overlap-20260827-151229
+  - name: runName
+    value: causal-qwen-overlap-20260827-151229
+  - name: namespace
+    value: kalantar-0
+  - name: phase
+    value: causalsloexternality-rdma-qwen-overlap
+  - name: scenarioContent
+    value: |
+      ---
+      scenario:
+      - decode:
+          acceleratorType:
+            labelKey: nvidia.com/gpu.product
+            labelValue: NVIDIA-H100-80GB-HBM3
+          parallelism:
+            tensor: 1
+          replicas: 2
+          vllm:
+            additionalFlags:
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=2048"
+            - "--enable-chunked-prefill"
+            - "--enable-prefix-caching"
+            - "--enable-force-include-usage"
+            - "--no-disable-uvicorn-access-log"
+            loggingLevel: INFO
+          initContainers:
+          - name: preprocess
+            imageKey: benchmark
+            imagePullPolicy: Always
+            command:
+            - set_llmdbench_environment.py
+            - "-e"
+            - "/shared-config/llmdbench_env.sh"
+            - "-i"
+            volumeMounts:
+            - name: shared-config
+              mountPath: "/shared-config"
+          extraEnvVars:
+          - name: NIXL_LOG_LEVEL
+            value: debug
+          - name: UCX_LOG_LEVEL
+            value: info
+          - name: UCX_PROTO_INFO
+            value: "y"
+          - name: UCX_MAX_RMA_RAILS
+            value: '1'
+          - name: NVSHMEM_DEBUG
+            value: none
+          - name: NCCL_DEBUG
+            value: WARN
+          extraContainerConfig:
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RAWIO
+                - NET_ADMIN
+                - NET_RAW
+              runAsGroup: 0
+              runAsUser: 0
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: '32'
+            requests:
+              memory: 64Gi
+              cpu: '16'
+        gateway:
+          className: epponly
+          externallyManaged: true
+        huggingface:
+          secretName: hf-secret
+        images:
+          routingSidecar:
+            repository: quay.io/vishakharamani/llm-d-router-disagg-sidecar
+            tag: 5f4e762-min-tokens-20260827
+            pullPolicy: Always
+        model:
+          blockSize: 16
+          gpuMemoryUtilization: 0.9
+          huggingfaceId: Qwen/Qwen3-14B
+          maxModelLen: 32768
+          name: Qwen/Qwen3-14B
+          path: models/Qwen/Qwen3-14B
+          shortName: qwen-qwen3-14b
+          size: 100Gi
+        modelArtifacts:
+          extraLabels:
+            pd-infocomm.io/gpu-type: NVIDIA-H100-80GB-HBM3
+        name: pdinfocomm2-qwen-mintok-smoke
+        prefill:
+          acceleratorType:
+            labelKey: nvidia.com/gpu.product
+            labelValue: NVIDIA-H100-80GB-HBM3
+          enabled: true
+          extraEnvVars:
+          - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+            value: '120'
+          - name: NIXL_LOG_LEVEL
+            value: debug
+          - name: UCX_LOG_LEVEL
+            value: info
+          - name: UCX_PROTO_INFO
+            value: "y"
+          - name: UCX_MAX_RMA_RAILS
+            value: '1'
+          - name: NVSHMEM_DEBUG
+            value: none
+          - name: NCCL_DEBUG
+            value: WARN
+          parallelism:
+            tensor: 1
+          replicas: 1
+          vllm:
+            additionalFlags:
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=2048"
+            - "--enable-chunked-prefill"
+            - "--enable-prefix-caching"
+            - "--enable-force-include-usage"
+          initContainers:
+          - name: preprocess
+            imageKey: benchmark
+            imagePullPolicy: Always
+            command:
+            - set_llmdbench_environment.py
+            - "-e"
+            - "/shared-config/llmdbench_env.sh"
+            - "-i"
+            volumeMounts:
+            - name: shared-config
+              mountPath: "/shared-config"
+          extraContainerConfig:
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RAWIO
+                - NET_ADMIN
+                - NET_RAW
+              runAsGroup: 0
+              runAsUser: 0
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: '32'
+            requests:
+              memory: 64Gi
+              cpu: '16'
+        router:
+          epp:
+            image:
+              pullPolicy: Always
+              registry: ghcr.io/kalantar
+              repository: llm-d-router
+              tag: 07f0062216a4-causalsloexternality
+            pluginsConfigFile: custom-plugins.yaml
+            pluginsCustomConfig:
+              custom-plugins.yaml: |
+                apiVersion: llm-d.ai/v1alpha1
+                kind: EndpointPickerConfig
+                plugins:
+                # Identical to the baseline's, deliberately: a_r and a_p must be computed the
+                # same way in both arms or the comparison is confounded. See the baseline
+                # overlay for the full reasoning on both producers.
+                - type: token-producer
+                  parameters:
+                    modelName: "Qwen/Qwen3-14B"
+                    vllm:
+                      url: "http://localhost:8000"
+                - type: approx-prefix-cache-producer
+                  parameters:
+                    # autoTune: true sizes each pod's prefix-cache LRU from that endpoint's
+                    # scraped CacheNumBlocks rather than the framework default of 31,250. It does
+                    # NOT make a_p vary with scrape state: GetBlockSize clamps below
+                    # minBlockSizeTokens = 64 and the engine reports 16, so both paths return 64.
+                    # blockSizeTokens stays stated at the value the clamp produces. Full reasoning,
+                    # including the cold-start analysis and the block_size < 64 coupling, is in the
+                    # baseline overlay.
+                    autoTune: true
+                    blockSizeTokens: 64
+
+                # THE POLICY, in two plugin entries over one shared state.
+                #
+                # `causal-slo-externality` owns the shadow table, the per-class output-length
+                # means and the configuration, and implements:
+                #   ProfileHandler        -> runs the role-blind profile, then splits the
+                #                            chosen pair into decode/prefill result entries
+                #   PreRequest            -> sets the prefill header; opens the shadow entry
+                #   ResponseBodyProcessor -> first token, steps done, deregistration
+                #
+                # `causal-slo-externality-picker` implements Filter (which is the only route
+                # by which the arriving request reaches the argmin) and Picker (the argmin
+                # itself), and resolves the policy plugin by name.
+                #
+                # TWO ENTRIES ARE REQUIRED, NOT A STYLE CHOICE. The scheduling Picker and
+                # ProfileHandler interfaces BOTH declare a method named `Pick` with different
+                # signatures, so no single Go type can satisfy both.
+                #
+                # DECLARATION ORDER IS LOAD-BEARING: the picker resolves its policy plugin
+                # through the plugin handle, and factories run in config declaration order, so
+                # `causal-slo-externality` MUST appear before the picker. Reversing them fails
+                # at startup with a "not found" error rather than misbehaving silently.
+                #
+                # The profile handler is NOT referenced from `schedulingProfiles` -- the config
+                # loader finds it by scanning instantiated plugins for the ProfileHandler
+                # interface. Only the picker is referenced.
+                - type: causal-slo-externality
+                  parameters:
+                    # === Objective ==================================================
+                    # V = 8, config.md 5. With capacity disabled V is a common positive
+                    # multiplier that cannot change the argmin. It is kept rather than folded
+                    # away because the ablation cohort's validity gate asserts
+                    # `score = 8 * (resident_externality - own_good)` exactly, and a port that
+                    # folds V away cannot reproduce that check.
+                    v: 8.0
+
+                    # === SLO targets, MICROSECONDS ==================================
+                    # All three workloads' triples from config.md 2, carried in every config so
+                    # the thresholds are never retyped, with exactly ONE active at a time. This
+                    # is the single source: there is deliberately no flat triple alongside the
+                    # map, because two sources could drift.
+                    #
+                    # WHY A SELECTOR RATHER THAN A PER-REQUEST LOOKUP. The thresholds are per
+                    # WORKLOAD, but `sim2real assemble` writes one `cluster/<algo>.yaml` per
+                    # PACKAGE and emits pipeline runs per (workload, package) with no
+                    # per-workload override hook, so exactly one triple is live per assemble.
+                    # A per-request class key cannot substitute: every cohort in all three
+                    # workloads declares `slo_class: standard`, so the class is one constant
+                    # string across the whole grid. In simulation tau varied PER INVOCATION,
+                    # not per class. Hence one assemble per workload, three runs.
+                    #
+                    # The keys below are WORKLOAD names, not SLO classes. A request-supplied
+                    # class overrides the selector only if it happens to name one of them,
+                    # which is forward compatibility rather than the mechanism.
+                    sloTargets:
+                      interactive:
+                        tauTTFTUs: 1000000      # 1,000 ms
+                        tauITLUs: 50000         # 50 ms
+                        tauE2EUs: 16000000      # 16,000 ms
+                      reasoning:
+                        tauTTFTUs: 2000000      # 2,000 ms
+                        tauITLUs: 100000        # 100 ms
+                        tauE2EUs: 802000000     # 802,000 ms
+                      deep_research:
+                        tauTTFTUs: 10000000     # 10,000 ms
+                        tauITLUs: 100000        # 100 ms
+                        tauE2EUs: 40000000      # 40,000 ms
+
+                    # >>> THIS IS THE ONE LINE TO CHANGE PER WORKLOAD RUN. <<<
+                    #
+                    # Set it to `reasoning` or `deep_research` and re-assemble into a SEPARATE
+                    # run to produce that workload's measurements. One value, not three
+                    # numbers -- all three triples above travel in every config, so the
+                    # thresholds themselves are never retyped.
+                    #
+                    # INTERACTIVE IS THE COMMITTED DEFAULT, for two reasons:
+                    #   1. It is where the mechanism has the most signal. The composite kernel
+                    #      reads only tau_ttft and tau_e2e, and a resident's charge scales as
+                    #      roughly 1/tau_e2e. Interactive's 16 s deadline gives about 50x the
+                    #      discrimination of reasoning's 802 s, at which the E2E sigmoid is
+                    #      effectively saturated and the externality stops separating
+                    #      candidates. Defaulting to reasoning would approach the same
+                    #      flattening failure by a different route.
+                    #   2. It owns the headline numbers. The focal arm's worst-regret cell is
+                    #      h100_homogeneous:interactive:medium_0p80, and the joint-versus-
+                    #      decode-first worst single cell is
+                    #      h100_a100_realistic:interactive:medium_0p80.
+                    #
+                    # An unresolvable value FAILS AT STARTUP. It does not fall back to a zero
+                    # triple, because a zero triple flattens the policy rather than loosening
+                    # it: every sigmoid factor becomes 1.0, every resident charge 1.0-1.0 = 0,
+                    # the externality 0 on every candidate, and the argmin a tie broken by
+                    # enumeration order. The policy would keep running and keep reporting
+                    # goodput while having stopped discriminating entirely.
+                    activeSLOTargets: interactive
+
+                    # === Engine geometry ============================================
+                    # Both MUST equal the engine's own settings or the score is wrong
+                    # everywhere. chunkTokens == --max-num-batched-tokens sets every nChunks
+                    # and every overlap window; blockSize == --block-size drives reqKVNeed and
+                    # all KV-block accounting. The plugin validates blockSize against the
+                    # scraped Metrics.CacheBlockSize and fails loudly on disagreement rather
+                    # than preferring one -- upstream has a single block size, and a port with
+                    # two that merely reconcile is a port with a latent unit bug.
+                    chunkTokens: 2048
+                    blockSize: 16
+
+                    # MaxBatchSize has NO metric route: Metrics carries the running count but
+                    # no capacity, and the engine exports no max-concurrency gauge. It must
+                    # equal the engine's --max-num-seqs (config.md 1, 256).
+                    #
+                    # Leaving it 0 is not a mild default. rollforwardTAdm's zero-wait fast path
+                    # is `BatchSize < MaxBatchSize && FreeKVBlocks >= ReqKVNeed`, and freeSlots
+                    # starts at MaxBatchSize - BatchSize. At 0 the fast path is unreachable and
+                    # freeSlots starts NEGATIVE, so the departure walk always falls through and
+                    # every endpoint takes the WAVE form on every decision -- converting
+                    # degradation D1 from a tail-behaviour bias into an always-on one.
+                    maxBatchSize: 256
+
+                    # Client-visible per-output-token post-processing (streaming
+                    # detokenization), outside the calibrated GPU-step coefficients and so
+                    # added explicitly to every TTFT projection. Upstream computes
+                    # clampToInt64(alpha_2) with alpha_2 = 45.907545 us, and clampToInt64
+                    # TRUNCATES: the value is exactly 45, not 46 and not 0.
+                    outputTokenProcessingUs: 45
+
+                    # === Transfer model -- MUST BE MEASURED (degradation D5) ========
+                    # config.md 4. These are the SIMULATOR's transfer-executor settings, NOT
+                    # target measurements. An unmeasured c_xfer mis-prices every disaggregated
+                    # candidate in one direction, biasing the local-vs-remote split
+                    # systematically rather than adding noise. Measure base latency and
+                    # bandwidth on the actual interconnect before trusting any magnitude.
+                    cXferSizeAware: true
+                    xferBaseUs: 50.0
+                    xferBandwidthGBps: 25.0
+                    # DERIVED, NOT MEASURED AND NOT IN THE BUNDLE. config.md 4 records only
+                    # "derived from model config and prefill TP". For Llama-3.3-70B at TP=4:
+                    #   2 (K and V) * 80 layers * 8 KV heads * 128 head_dim * 2 bytes (fp16)
+                    #     = 327,680 bytes/token, / TP 4 = 81,920 bytes/token/GPU.
+                    # Confirm against the served model's config.json before a cluster run.
+                    kvBytesPerTokenPerGPU: 81920.0
+
+                    # === Per-endpoint physics =======================================
+                    # Coefficients are selected PER ENDPOINT by GPU type. config.md 3 records
+                    # that heterogeneity rides the per-iteration intercept alpha -- present on
+                    # every iteration regardless of KV state -- so a wrong or defaulted GPU
+                    # label is wrong on every decision, not merely under load. At B=8,
+                    # KV=16384 T_iter is 17,437 us on H100 against 26,893 us on A100, and
+                    # 9,000 us of that 9,456 us gap is the intercept ratio alone.
+                    #
+                    # The plugin REJECTS an endpoint whose label is absent or unrecognised. It
+                    # never defaults, because defaulting picks the wrong intercept silently.
+                    #
+                    # Keyed by the POD label value, read from EndpointMetadata.Labels: plugins
+                    # see pod labels, never the node's nvidia.com/gpu.product.
+                    gpuTypeLabelKey: pd-infocomm.io/gpu-type
+                    coefficients:
+                      # inputs/coeffs-llama70b-h100-tp4.json
+                      NVIDIA-H100-80GB-HBM3:
+                        alphaDUs: 16613.537554540144
+                        alphaPUs: 16617.85321583337
+                        c0UsPerReq: 5.347316038602452
+                        c1UsPerToken: 0.04761401141756073
+                        cPfUsPerToken: 6.144687138665833
+                        cAttnUsPerUnit: 0.00010075247918809842
+                      # inputs/coeffs-llama70b-a100real-tp4.json. Unused by the committed
+                      # homogeneous H100 fleet (config.md "Fleet topology" option 3), present
+                      # so a heterogeneous fleet needs no plugin change.
+                      # CONFIRM the cluster's actual nvidia.com/gpu.product before using it:
+                      # config.md flags SXM-vs-PCIe as unverified.
+                      NVIDIA-A100-SXM4-80GB:
+                        alphaDUs: 25563.819286862163
+                        alphaPUs: 25568.34953836831
+                        c0UsPerReq: 5.945331876073271
+                        c1UsPerToken: 0.07822809856114352
+                        cPfUsPerToken: 9.794219053944662
+                        cAttnUsPerUnit: 0.00015977670754642687
+
+                    # === Wiring =====================================================
+                    # Role label, used to partition the role-blind candidate slice into the
+                    # decode and prefill pools. bylabel.RoleLabel is the in-tree constant that
+                    # decode-filter and prefill-filter key on.
+                    roleLabelKey: llm-d.ai/role
+
+                    # Binds a_p to the SAME producer the baseline uses. A DataKey's identity
+                    # includes its producer name, so this string is what makes the two arms
+                    # read one prefix signal instead of two.
+                    prefixMatchInfoProducerName: approx-prefix-cache-producer
+
+                    # The single role-blind profile this policy runs, and the two synthetic
+                    # result keys ProcessResults splits the chosen pair into. `prefillProfile`
+                    # is the key PreRequest reads to set the prefill endpoint header.
+                    profiles:
+                      joint: joint
+                      decode: decode
+                      prefill: prefill
+
+                    # === Ablation switches ==========================================
+                    # The focal arm is noCapacity only. The other three define the ablation
+                    # cohort and are retained so it can be reproduced without a code change.
+                    #
+                    # decomposed: true truncates the decode candidate list to its first
+                    # element, which IS the target's stock decode-first decomposition and costs
+                    # a measured -0.0485 equal-cell mean goodput and -0.1555 worst cell. It is
+                    # a DIFFERENT ALGORITHM, not a tuning knob. Setting it true is also the
+                    # cheapest on-cluster check that the joint shape survived the port
+                    # (README.md "Pre-registered expectation" item 3).
+                    noCapacity: true
+                    noExternality: false
+                    noOwnGood: false
+                    decomposed: false
+
+                - type: causal-slo-externality-picker
+                  parameters:
+                    policyPluginName: causal-slo-externality
+
+                schedulingProfiles:
+                # ONE ROLE-BLIND PROFILE. This is the load-bearing structural choice.
+                #
+                # Every profile receives the same candidateEndpoints slice
+                # (pkg/epp/scheduling/scheduler.go:78), so a profile carrying NO role filter
+                # sees both the decode and the prefill pool and the picker can enumerate the
+                # full cross product: D local candidates plus D*P disaggregated ones, scored on
+                # one scale in one argmin.
+                #
+                # There is deliberately NO decode-filter and NO prefill-filter here. Adding
+                # either would split the pools, reduce the picker to one role, and silently
+                # convert this into the decode-first decomposition.
+                #
+                # The picker is named EXPLICITLY even though it is the only Picker in the
+                # config: the loader otherwise injects the first Picker it finds by
+                # nondeterministic map iteration into any profile lacking one
+                # (pkg/epp/config/loader/defaults.go:179-215).
+                #
+                # No scorers. The picker computes J itself from the Endpoint values and
+                # IGNORES the inherited .Score field, because every scorer's contribution is
+                # passed through enforceScoreRange, which clamps to [0,1]
+                # (pkg/epp/scheduling/scheduler_profile.go:178, :215-223). J is signed and
+                # unbounded, so clamping would collapse every candidate with J <= 0 to one
+                # score and destroy the ranking rather than degrade it.
+                - name: joint
+                  plugins:
+                  - pluginRef: causal-slo-externality-picker
+            replicas: 1
+            verbosity: '5'
+          proxy:
+            resources:
+              limits:
+                cpu: '8'
+                memory: 16Gi
+              requests:
+                cpu: '4'
+                memory: 8Gi
+          tokenizer:
+            enabled: true
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: HF_TOKEN
+                  name: hf-secret
+            - name: HF_HOME
+              value: "/tmp/hf"
+        routing:
+          proxy:
+            resources:
+              requests:
+                cpu: 4
+                memory: 16Gi
+          connector: nixlv2
+        storage:
+          modelPvc:
+            size: 1Ti
+        vllmCommon:
+          flags:
+            enforceEager: false
+          kvTransfer:
+            connector: NixlConnector
+            enabled: true
+            role: kv_both
+          ucxTls: rc,sm,cuda_ipc,cuda_copy
+          preprocessScript: export LD_LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\n'
+            2>/dev/null | sed ':a; N; $!ba; s/\n/:/g'):${LD_LIBRARY_PATH} ; export LIBRARY_PATH=$(find
+            / -name libcuda.so.1 -printf '%h\n' 2>/dev/null | head -1):${LIBRARY_PATH} ;
+            . /shared-config/llmdbench_env.sh
+          networkResource: rdma/roce_gdr
+          networkNr: '1'
+          volumes:
+          - name: shared-config
+            type: emptyDir
+            emptyDir: {}
+          - name: dshm
+            type: emptyDir
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          volumeMounts:
+          - name: shared-config
+            mountPath: "/shared-config"
+          - name: dshm
+            mountPath: "/dev/shm"
+        annotations:
+          decode:
+            pod:
+              k8s.v1.cni.cncf.io/networks: openshift-sriov-network-operator/multi-nic-compute
+          prefill:
+            pod:
+              k8s.v1.cni.cncf.io/networks: openshift-sriov-network-operator/multi-nic-compute
+  - name: specContent
+    value: |
+      base_dir: /workspace/source/llm-d-benchmark
+
+      values_file:
+        path: /workspace/source/llm-d-benchmark/config/templates/values/defaults.yaml
+
+      template_dir:
+        path: /workspace/source/llm-d-benchmark/config/templates/jinja
+
+      scenario_file:
+        path: /tmp/llmdbench-config/scenario.yaml
+  - name: workloadName
+    value: interactive-chat-single-turn
+  - name: workloadSpec
+    value: |
+      ---
+      aggregate_rate: 1.0
+      category: language
+      cohorts:
+      - arrival:
+          process: poisson
+        id: interactive-chat
+        input_distribution:
+          params:
+            max: 15000
+            min: 15000
+            mu: 8.129173
+            sigma: 0.574241
+          type: lognormal
+        output_distribution:
+          params:
+            max: 512
+            mean: 512
+            min: 512
+            std_dev: 0
+          type: gaussian
+        population: 1
+        prefix_group: interactive-system-prompt
+        prefix_length: 1000
+        prefix_sharing: per_member
+        rate_fraction: 1.0
+        slo_class: standard
+        streaming: true
+        tenant_id: interactive-users
+      num_requests: 20
+      seed: 4242
+      version: '2'
+  - name: benchmarkGitRepoUrl
+    value: https://github.com/llm-d/llm-d-benchmark.git
+  - name: benchmarkGitCommit
+    value: 76473d05a0f546a6bc0c4662ed7e34104da73891
+  - name: blisGitRepoUrl
+    value: https://github.com/kalantar/inference-sim.git
+  - name: blisGitCommit
+    value: cc8846cc41e71488cc32004778dde83dc747a2f7
+  - name: model
+    value: Qwen/Qwen3-14B
+  - name: replica
+    value: '1'
+  - name: maxConcurrency
+    value: '12'
+  - name: timeout
+    value: '1800'
+  - name: warmupRequests
+    value: '0'
+  - name: prewarmDuration
+    value: 0s
+  - name: extraArgs
+    value: ''
+  pipelineRef:
+    name: sim2real
+  taskRunSpecs:
+  - pipelineTaskName: stream-epp-logs
+    timeout: 3h
+  - pipelineTaskName: stream-gpu-stats
+    timeout: 3h
+  - pipelineTaskName: run-workload-blis-observe-binary
+    timeout: 3h
+  taskRunTemplate:
+    serviceAccountName: helm-installer
+  timeouts:
+    pipeline: 4h
+  workspaces:
+  - name: data-storage
+    persistentVolumeClaim:
+      claimName: data-pvc
+  - name: source
+    persistentVolumeClaim:
+      claimName: source-pvc

@@ -144,6 +144,16 @@ func tokenLimitFieldsForAPIType(api APIType) []string {
 	}
 }
 
+// capPrefillMinTokens keeps a one-token prefill request valid when the client
+// supplied a larger minimum generation length. The decode request must retain
+// the client's original value; callers that mutate the original map are
+// responsible for restoring it before dispatching decode.
+func capPrefillMinTokens(request map[string]any) {
+	if _, present := request[requestFieldMinTokens]; present {
+		request[requestFieldMinTokens] = 1
+	}
+}
+
 // Config represents the complete runtime configuration for the proxy server.
 type Config struct {
 	// Port is the port the sidecar is listening on.

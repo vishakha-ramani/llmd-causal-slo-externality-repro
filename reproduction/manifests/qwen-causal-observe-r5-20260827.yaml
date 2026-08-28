@@ -1,0 +1,383 @@
+---
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: qwen-causal-observe-r5-20260827
+  namespace: vramani-perfcal
+spec:
+  params:
+  - name: experimentId
+    value: qwen-causal-observe-r5-20260827
+  - name: runName
+    value: qwen-causal-observe-r5-20260827
+  - name: namespace
+    value: vramani-perfcal
+  - name: phase
+    value: causal-qwen-controlled-iterlaw
+  - name: scenarioContent
+    value: |
+      ---
+      scenario:
+      - decode:
+          acceleratorType:
+            labelKey: nvidia.com/gpu.product
+            labelValue: NVIDIA-H100-80GB-HBM3
+          parallelism:
+            tensor: 1
+          replicas: 2
+          vllm:
+            additionalFlags:
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=2048"
+            - "--enable-chunked-prefill"
+            - "--enable-force-include-usage"
+            - "--no-disable-uvicorn-access-log"
+            - "--no-enable-prefix-caching"
+            loggingLevel: INFO
+          initContainers:
+          - name: preprocess
+            imageKey: benchmark
+            imagePullPolicy: Always
+            command:
+            - set_llmdbench_environment.py
+            - "-e"
+            - "/shared-config/llmdbench_env.sh"
+            - "-i"
+            volumeMounts:
+            - name: shared-config
+              mountPath: "/shared-config"
+          extraEnvVars:
+          - name: NIXL_LOG_LEVEL
+            value: debug
+          - name: UCX_LOG_LEVEL
+            value: info
+          - name: UCX_PROTO_INFO
+            value: "y"
+          - name: UCX_MAX_RMA_RAILS
+            value: '1'
+          - name: NVSHMEM_DEBUG
+            value: none
+          - name: NCCL_DEBUG
+            value: WARN
+          extraContainerConfig:
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RAWIO
+                - NET_ADMIN
+                - NET_RAW
+              runAsGroup: 0
+              runAsUser: 0
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: '32'
+            requests:
+              memory: 64Gi
+              cpu: '16'
+        gateway:
+          className: epponly
+          externallyManaged: true
+        huggingface:
+          secretName: hf-secret
+        images:
+          routingSidecar:
+            repository: quay.io/vishakharamani/llm-d-router-disagg-sidecar
+            tag: causal-qwen-observability-v2-20260827
+            pullPolicy: Always
+        model:
+          blockSize: 16
+          gpuMemoryUtilization: 0.9
+          huggingfaceId: Qwen/Qwen3-14B
+          maxModelLen: 32768
+          name: Qwen/Qwen3-14B
+          path: models/Qwen/Qwen3-14B
+          shortName: qwen-qwen3-14b
+          size: 100Gi
+        modelArtifacts:
+          extraLabels:
+            pd-infocomm.io/gpu-type: NVIDIA-H100-80GB-HBM3
+        name: pdinfocomm2-qwen-controlled-iterlaw
+        prefill:
+          acceleratorType:
+            labelKey: nvidia.com/gpu.product
+            labelValue: NVIDIA-H100-80GB-HBM3
+          enabled: true
+          extraEnvVars:
+          - name: VLLM_HTTP_TIMEOUT_KEEP_ALIVE
+            value: '120'
+          - name: NIXL_LOG_LEVEL
+            value: debug
+          - name: UCX_LOG_LEVEL
+            value: info
+          - name: UCX_PROTO_INFO
+            value: "y"
+          - name: UCX_MAX_RMA_RAILS
+            value: '1'
+          - name: NVSHMEM_DEBUG
+            value: none
+          - name: NCCL_DEBUG
+            value: WARN
+          parallelism:
+            tensor: 1
+          replicas: 1
+          vllm:
+            additionalFlags:
+            - "--max-num-seqs=256"
+            - "--max-num-batched-tokens=2048"
+            - "--enable-chunked-prefill"
+            - "--enable-force-include-usage"
+            - "--no-enable-prefix-caching"
+          initContainers:
+          - name: preprocess
+            imageKey: benchmark
+            imagePullPolicy: Always
+            command:
+            - set_llmdbench_environment.py
+            - "-e"
+            - "/shared-config/llmdbench_env.sh"
+            - "-i"
+            volumeMounts:
+            - name: shared-config
+              mountPath: "/shared-config"
+          extraContainerConfig:
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RAWIO
+                - NET_ADMIN
+                - NET_RAW
+              runAsGroup: 0
+              runAsUser: 0
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: '32'
+            requests:
+              memory: 64Gi
+              cpu: '16'
+        router:
+          epp:
+            image:
+              pullPolicy: Always
+              registry: quay.io/vishakharamani
+              repository: llm-d-router
+              tag: causal-qwen-observability-v2-20260827
+            pluginsConfigFile: custom-plugins.yaml
+            pluginsCustomConfig:
+              custom-plugins.yaml: |
+                ---
+                apiVersion: llm-d.ai/v1alpha1
+                kind: EndpointPickerConfig
+                plugins:
+                - type: token-producer
+                  parameters:
+                    modelName: Qwen/Qwen3-14B
+                    vllm:
+                      url: http://localhost:8000
+                - type: approx-prefix-cache-producer
+                  parameters:
+                    autoTune: true
+                    blockSizeTokens: 64
+                - type: causal-slo-externality
+                  parameters:
+                    v: 8.0
+                    sloTargets:
+                      interactive:
+                        tauTTFTUs: 1000000
+                        tauITLUs: 50000
+                        tauE2EUs: 16000000
+                      reasoning:
+                        tauTTFTUs: 2000000
+                        tauITLUs: 100000
+                        tauE2EUs: 802000000
+                      deep_research:
+                        tauTTFTUs: 10000000
+                        tauITLUs: 100000
+                        tauE2EUs: 40000000
+                    activeSLOTargets: interactive
+                    chunkTokens: 2048
+                    blockSize: 16
+                    maxBatchSize: 256
+                    outputTokenProcessingUs: 45
+                    cXferSizeAware: true
+                    xferBaseUs: 595.162
+                    xferBandwidthGBps: 12.213979
+                    kvBytesPerTokenPerGPU: 163840.0
+                    gpuTypeLabelKey: pd-infocomm.io/gpu-type
+                    coefficients:
+                      NVIDIA-H100-80GB-HBM3:
+                        alphaDUs: 10884.573061102548
+                        alphaPUs: 10884.573061102548
+                        c0UsPerReq: 10.41982736103468
+                        c1UsPerToken: 0.05267373344102902
+                        cPfUsPerToken: 39.80641832728769
+                        cAttnUsPerUnit: 0.0014236690050459294
+                    roleLabelKey: llm-d.ai/role
+                    prefixMatchInfoProducerName: approx-prefix-cache-producer
+                    profiles:
+                      joint: joint
+                      decode: decode
+                      prefill: prefill
+                    noCapacity: true
+                    noExternality: false
+                    noOwnGood: false
+                    decomposed: false
+                    requireNoResidentPrefill: true
+                    prefixCachingDisabled: true
+                - type: causal-slo-externality-picker
+                  parameters:
+                    policyPluginName: causal-slo-externality
+                schedulingProfiles:
+                - name: joint
+                  plugins:
+                  - pluginRef: causal-slo-externality-picker
+            replicas: 1
+            verbosity: '5'
+          proxy:
+            resources:
+              limits:
+                cpu: '8'
+                memory: 16Gi
+              requests:
+                cpu: '4'
+                memory: 8Gi
+          tokenizer:
+            enabled: true
+            env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  key: HF_TOKEN
+                  name: hf-secret
+            - name: HF_HOME
+              value: "/tmp/hf"
+        routing:
+          proxy:
+            resources:
+              requests:
+                cpu: 4
+                memory: 16Gi
+            zapLogLevel: 4
+          connector: nixlv2
+        storage:
+          modelPvc:
+            size: 100Gi
+        vllmCommon:
+          flags:
+            enforceEager: false
+          kvTransfer:
+            connector: NixlConnector
+            enabled: true
+            role: kv_both
+          ucxTls: rc,sm,cuda_ipc,cuda_copy
+          preprocessScript: export LD_LIBRARY_PATH=$(find / -name libcuda.so.1 -printf '%h\n'
+            2>/dev/null | sed ':a; N; $!ba; s/\n/:/g'):${LD_LIBRARY_PATH} ; export LIBRARY_PATH=$(find
+            / -name libcuda.so.1 -printf '%h\n' 2>/dev/null | head -1):${LIBRARY_PATH} ;
+            . /shared-config/llmdbench_env.sh
+          networkResource: rdma/roce_gdr
+          networkNr: '1'
+          volumes:
+          - name: shared-config
+            type: emptyDir
+            emptyDir: {}
+          - name: dshm
+            type: emptyDir
+            emptyDir:
+              medium: Memory
+              sizeLimit: 16Gi
+          volumeMounts:
+          - name: shared-config
+            mountPath: "/shared-config"
+          - name: dshm
+            mountPath: "/dev/shm"
+        annotations:
+          decode:
+            pod:
+              k8s.v1.cni.cncf.io/networks: openshift-sriov-network-operator/multi-nic-compute
+          prefill:
+            pod:
+              k8s.v1.cni.cncf.io/networks: openshift-sriov-network-operator/multi-nic-compute
+  - name: specContent
+    value: |
+      base_dir: /workspace/source/llm-d-benchmark
+
+      values_file:
+        path: /workspace/source/llm-d-benchmark/config/templates/values/defaults.yaml
+
+      template_dir:
+        path: /workspace/source/llm-d-benchmark/config/templates/jinja
+
+      scenario_file:
+        path: /tmp/llmdbench-config/scenario.yaml
+  - name: workloadName
+    value: interactive-chat-single-turn
+  - name: workloadSpec
+    value: |
+      ---
+      version: '2'
+      seed: 4242
+      category: language
+      aggregate_rate: 1.0
+      num_requests: 20
+      cohorts:
+      - id: interactive-controlled
+        population: 1
+        tenant_id: interactive-users
+        slo_class: standard
+        rate_fraction: 1.0
+        streaming: true
+        arrival:
+          process: constant
+        input_distribution:
+          type: constant
+          params:
+            value: 15000
+        output_distribution:
+          type: constant
+          params:
+            value: 512
+  - name: benchmarkGitRepoUrl
+    value: https://github.com/llm-d/llm-d-benchmark.git
+  - name: benchmarkGitCommit
+    value: 76473d05a0f546a6bc0c4662ed7e34104da73891
+  - name: blisGitRepoUrl
+    value: https://github.com/kalantar/inference-sim.git
+  - name: blisGitCommit
+    value: cc8846cc41e71488cc32004778dde83dc747a2f7
+  - name: model
+    value: Qwen/Qwen3-14B
+  - name: replica
+    value: '1'
+  - name: maxConcurrency
+    value: '20'
+  - name: timeout
+    value: '1800'
+  - name: warmupRequests
+    value: '0'
+  - name: prewarmDuration
+    value: 0s
+  - name: extraArgs
+    value: ''
+  pipelineRef:
+    name: sim2real
+  taskRunSpecs:
+  - pipelineTaskName: stream-epp-logs
+    timeout: 3h
+  - pipelineTaskName: stream-gpu-stats
+    timeout: 3h
+  - pipelineTaskName: run-workload-blis-observe-binary
+    timeout: 3h
+  taskRunTemplate:
+    serviceAccountName: helm-installer
+  timeouts:
+    pipeline: 4h
+  workspaces:
+  - name: data-storage
+    persistentVolumeClaim:
+      claimName: data-pvc
+  - name: source
+    persistentVolumeClaim:
+      claimName: source-pvc

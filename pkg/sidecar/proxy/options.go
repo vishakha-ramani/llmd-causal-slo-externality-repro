@@ -53,6 +53,7 @@ const (
 
 	// Flags
 	port                      = "port"
+	modelServerPort           = "model-server-port"
 	vllmPort                  = "vllm-port"
 	dataParallelSize          = "data-parallel-size"
 	kvConnector               = "kv-connector"
@@ -247,6 +248,7 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 	// Add Go flags to pflag (for zap options compatibility)
 	fs.AddGoFlagSet(goFlagSet)
 	fs.StringVar(&opts.Port, port, opts.Port, "the port the sidecar is listening on")
+	fs.StringVar(&opts.vllmPort, modelServerPort, opts.vllmPort, "the port the model server is listening on")
 	fs.StringVar(&opts.vllmPort, vllmPort, opts.vllmPort, "the port vLLM is listening on")
 	fs.IntVar(&opts.DataParallelSize, dataParallelSize, opts.DataParallelSize, "the vLLM DATA-PARALLEL-SIZE value")
 	fs.StringVar(&opts.KVConnector, kvConnector, opts.KVConnector,
