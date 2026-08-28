@@ -6,7 +6,7 @@
 ARG BASE_IMAGE=gcr.io/distroless/static:nonroot
 
 # Build Stage: using Go 1.25.11 image
-FROM --platform=${BUILDPLATFORM} golang:1.25.11 AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.25.14 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
